@@ -25,6 +25,7 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"  # FR-09
 # qwen3.8-27b is the same family and size. Override with GROQ_MODEL in .env.
 LLM_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 TOP_K = 3  # FR-07: top-3 per collection
+HISTORY_EXCHANGES = 5  # agent PRD FR-50: recent user/assistant exchanges passed as context
 CHUNK_SIZE = 600  # FR-16
 CHUNK_OVERLAP = 100
 

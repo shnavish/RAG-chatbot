@@ -3,10 +3,19 @@ import time
 
 import streamlit as st
 
-from chain import MissingApiKeyError, stream_answer
+from assistant import Assistant
+from chain import MissingApiKeyError
 from config import CHROMA_DIR, FALLBACK_MESSAGE, collection_counts
 from interaction_log import log_answer, log_feedback
-from retriever import COLLECTIONS, get_merged_retriever, retrieve
+from refund_data import AccountStore
+from retriever import COLLECTIONS, get_merged_retriever
+
+REFUND_SAMPLES = [
+    "I want a refund of ₹499.",
+    "I want a refund of ₹999.",
+    "Give me a refund of ₹2,000.",
+    "I want a refund.",
+]
 
 SAMPLE_QUESTIONS = [
     "Why is my mobile internet so slow?",
@@ -66,11 +75,37 @@ def render_feedback(msg: dict) -> None:
         st.feedback("thumbs", key=key, on_change=on_feedback, args=(key, msg["id"]))
 
 
+def render_trace(trace: list[str]) -> None:
+    if trace:
+        with st.expander("Workflow steps"):
+            st.code("\n".join(trace), language=None)
+
+
+def set_action(action: str) -> None:
+    st.session_state.pending_action = action
+
+
+def render_confirm_buttons(index: int) -> None:
+    """Refund confirmation step (agent PRD section 11)."""
+    left, right, _ = st.columns([2, 1.2, 2])
+    left.button("Confirm Refund", key=f"confirm_{index}", type="primary", use_container_width=True,
+                on_click=set_action, args=("confirm",))
+    right.button("Cancel", key=f"cancel_{index}", use_container_width=True,
+                 on_click=set_action, args=("cancel",))
+
+
 # ---------- session state ----------
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "pending" not in st.session_state:
-    st.session_state.pending = None
+for key, default in {"messages": [], "pending": None, "pending_action": None,
+                     "store": None, "assistant": None}.items():
+    if key not in st.session_state:
+        st.session_state[key] = default
+if st.session_state.store is None:
+    st.session_state.store = AccountStore()
+
+
+def new_assistant() -> Assistant:
+    return Assistant(store=st.session_state.store, retriever=load_retriever())
+
 
 # ---------- sidebar ----------
 with st.sidebar:
@@ -82,11 +117,29 @@ with st.sidebar:
         if st.button(q, use_container_width=True):  # FR-02
             st.session_state.pending = q
 
+    st.subheader("Try a refund")
+    for q in REFUND_SAMPLES:
+        if st.button(q, use_container_width=True, key=f"refund_{q}"):
+            st.session_state.pending = q
+
     st.divider()
-    if st.button("🗑️ Clear conversation", use_container_width=True):  # FR-04
+    if st.button("🗑️ Clear conversation", use_container_width=True):  # FR-04, agent FR-48
         st.session_state.messages = []
         st.session_state.pending = None
+        st.session_state.pending_action = None
+        st.session_state.assistant = None  # drops any pending refund
         st.rerun()
+
+    with st.expander("Demo account (simulated)"):
+        user = st.session_state.store.get_user("user_123")
+        st.caption(f"Signed in as {user['name']} · {user['plan']} plan")
+        for r in user["recharges"]:
+            st.write(f"{r['recharge_id']}: ₹{r['recharge_amount']} · {r['recharge_age_days']}d ago · "
+                     f"{r['refund_status']}")
+        if st.button("Reset demo account", use_container_width=True):
+            st.session_state.store = AccountStore()
+            st.session_state.assistant = None
+            st.rerun()
 
     with st.expander("Knowledge base"):
         try:
@@ -112,31 +165,52 @@ if kb_empty:
     st.stop()
 
 load_retriever()  # warm the embedding model once per server, with a visible spinner
+if st.session_state.assistant is None:
+    st.session_state.assistant = new_assistant()
+assistant: Assistant = st.session_state.assistant
 
-for msg in st.session_state.messages:  # FR-03
+messages = st.session_state.messages
+for i, msg in enumerate(messages):  # FR-03
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
         if msg["role"] == "assistant":
             render_sources(msg.get("sources", []))
+            render_trace(msg.get("trace", []))
+            if (msg.get("confirm") and i == len(messages) - 1
+                    and assistant.agent.awaiting_confirmation and not st.session_state.pending_action):
+                render_confirm_buttons(i)
             render_feedback(msg)
 
-typed = st.chat_input("Ask a question about your mobile service…")
+typed = st.chat_input("Ask a question or request a refund…")
+action = st.session_state.pending_action
 question = typed or st.session_state.pending
 st.session_state.pending = None
+st.session_state.pending_action = None
+
+if action:  # Confirm Refund / Cancel button
+    question = "Yes, proceed" if action == "confirm" else "Cancel"
 
 if question:
-    st.session_state.messages.append({"role": "user", "content": question})
+    history = list(messages)  # earlier messages, before this one (agent FR-46)
+    messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
     with st.chat_message("assistant"):
         start = time.perf_counter()
         sources: list[dict] = []
+        trace: list[str] = []
+        turn = None
         try:
-            with st.spinner("Searching the knowledge base…"):
-                docs = retrieve(question, load_retriever())
-            sources = to_sources(docs)
-            answer = st.write_stream(stream_answer(question, docs))  # FR-05
+            with st.spinner("Thinking…"):
+                turn = assistant.confirm(action == "confirm") if action else assistant.handle(question, history)
+            trace = turn.trace
+            if turn.route == "rag":
+                sources = to_sources(turn.docs)
+                answer = st.write_stream(turn.stream)  # FR-05
+            else:
+                answer = turn.text
+                st.markdown(answer)
         except MissingApiKeyError as e:
             answer = f"⚠️ {e}"
             st.markdown(answer)
@@ -147,9 +221,13 @@ if question:
 
         latency = time.perf_counter() - start
         answer = answer if isinstance(answer, str) else "".join(answer)
-        msg = {"role": "assistant", "content": answer, "sources": sources}
-        if sources and not answer.startswith("⚠️"):
-            msg["id"] = log_answer(question, answer, sources, latency, channel="web")
+        msg = {"role": "assistant", "content": answer, "sources": sources, "trace": trace,
+               "confirm": bool(turn and turn.needs_confirmation)}
+        if turn and not answer.startswith("⚠️"):
+            msg["id"] = log_answer(question, answer, sources, latency, channel="web", route=turn.route)
         render_sources(sources)
+        render_trace(trace)
+        messages.append(msg)
+        if turn and turn.route == "refund":
+            st.rerun()  # redraw so the confirm buttons and demo-account panel reflect the new state
         render_feedback(msg)
-        st.session_state.messages.append(msg)

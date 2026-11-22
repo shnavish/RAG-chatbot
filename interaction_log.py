@@ -17,12 +17,13 @@ def _write(record: dict) -> None:
 
 
 def log_answer(question: str, answer: str, sources: list[dict], latency_s: float,
-               channel: str) -> str:
+               channel: str, route: str = "rag") -> str:
     interaction_id = uuid.uuid4().hex
     _write({
         "event": "answer",
         "id": interaction_id,
         "channel": channel,
+        "route": route,
         "question": question,
         "answer": answer,
         "sources": [s["ref"] for s in sources],

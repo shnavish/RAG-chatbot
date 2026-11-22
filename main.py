@@ -1,20 +1,28 @@
-"""Interactive CLI (FR-18). Type 'quit' to exit (FR-19)."""
+"""Interactive CLI (FR-18). Type 'quit' to exit (FR-19).
+
+Handles both support questions (RAG) and refund requests (Refund Agent). When a refund
+needs confirmation, reply "Yes, proceed" or "Cancel". Type 'clear' to reset the conversation.
+"""
 import sys
 import time
 
-from chain import MissingApiKeyError, stream_answer
+from assistant import Assistant
+from chain import MissingApiKeyError
 from config import CHROMA_DIR
 from interaction_log import log_answer
-from retriever import get_merged_retriever, retrieve
+from retriever import get_merged_retriever
 
 
 def main() -> None:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # "₹" on Windows consoles
     if not CHROMA_DIR.exists():
         print("Knowledge base not found. Run:  python ingest_all.py")
         sys.exit(1)
 
-    print("Telecom Support Assistant (CLI). Type 'quit' to exit.\n")
+    print("Telecom Support Assistant (CLI). Type 'quit' to exit, 'clear' to start over.\n")
     retriever = get_merged_retriever()
+    assistant = Assistant(retriever=retriever)
+    history: list[dict] = []
     while True:
         try:
             question = input("You: ").strip()
@@ -25,22 +33,36 @@ def main() -> None:
             continue
         if question.lower() == "quit":
             break
+        if question.lower() == "clear":  # resets history and any pending refund
+            history = []
+            assistant.agent.reset()
+            print("(conversation cleared)\n")
+            continue
 
         start = time.perf_counter()
-        docs = retrieve(question, retriever)
-        print("Bot: ", end="", flush=True)
-        parts = []
         try:
-            for token in stream_answer(question, docs):
-                parts.append(token)
-                print(token, end="", flush=True)
+            turn = assistant.handle(question, history)
+            print("Bot: ", end="", flush=True)
+            if turn.route == "rag":
+                parts = []
+                for token in turn.stream:
+                    parts.append(token)
+                    print(token, end="", flush=True)
+                answer = "".join(parts)
+                print()
+                print("Sources: " + ", ".join(d.metadata.get("ref", "?") for d in turn.docs))
+            else:
+                answer = turn.text
+                print(answer)
+                if turn.needs_confirmation:
+                    print('(Reply "Yes, proceed" or "Cancel")')
         except MissingApiKeyError as e:
             print(e)
             continue
         print()
-        print("Sources: " + ", ".join(d.metadata.get("ref", "?") for d in docs) + "\n")
-        sources = [{"ref": d.metadata.get("ref", "?")} for d in docs]
-        log_answer(question, "".join(parts), sources, time.perf_counter() - start, channel="cli")
+        sources = [{"ref": d.metadata.get("ref", "?")} for d in turn.docs]
+        log_answer(question, answer, sources, time.perf_counter() - start, channel="cli", route=turn.route)
+        history += [{"role": "user", "content": question}, {"role": "assistant", "content": answer}]
     print("Goodbye!")
 
 

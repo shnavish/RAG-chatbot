@@ -5,10 +5,11 @@ from typing import Iterator
 
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 
-from config import FALLBACK_MESSAGE, LLM_MODEL
+from config import FALLBACK_MESSAGE, HISTORY_EXCHANGES, LLM_MODEL
 from retriever import format_context, get_merged_retriever, retrieve
 
 SYSTEM_PROMPT = """You are NovaCell's customer care assistant for a mobile telecom operator.
@@ -33,13 +34,30 @@ STRICT RULES
 5. Be concise and friendly. Use short numbered steps for troubleshooting.
 6. Do not mention "the context", "documents" or source labels in your answer; the app shows
    sources separately.
+7. Earlier messages in the conversation are only for understanding what the customer refers
+   to (for example "that" or "it"). Facts must still come from the CONTEXT.
 
 CONTEXT
 {context}"""
 
 PROMPT = ChatPromptTemplate.from_messages(
-    [("system", SYSTEM_PROMPT), ("human", "{question}")]
+    [("system", SYSTEM_PROMPT), MessagesPlaceholder("history", optional=True), ("human", "{question}")]
 ).partial(fallback=FALLBACK_MESSAGE)
+
+
+def recent_history(messages: list[dict], exchanges: int = HISTORY_EXCHANGES) -> list[dict]:
+    """Last N user/assistant exchanges (agent PRD FR-50). Items: {"role", "content"}."""
+    convo = [m for m in messages if m.get("role") in ("user", "assistant") and m.get("content")]
+    return convo[-2 * exchanges:]
+
+
+def to_messages(history: list[dict]) -> list[BaseMessage]:
+    """Convert {"role", "content"} dicts to LangChain messages (long answers trimmed)."""
+    out: list[BaseMessage] = []
+    for m in recent_history(history):
+        text = m["content"][:1500]
+        out.append(HumanMessage(text) if m["role"] == "user" else AIMessage(text))
+    return out
 
 
 class MissingApiKeyError(RuntimeError):
@@ -79,14 +97,20 @@ def get_rag_chain():
     )
 
 
-def stream_answer(question: str, docs: list[Document]) -> Iterator[str]:
-    """Stream the answer token by token (FR-05) for already-retrieved docs."""
+def stream_answer(question: str, docs: list[Document],
+                  history: list[dict] | None = None) -> Iterator[str]:
+    """Stream the answer token by token (FR-05) for already-retrieved docs.
+
+    `history` is passed to the LLM only; retrieval still uses the raw question
+    (agent PRD FR-49).
+    """
     return get_answer_chain().stream(
-        {"context": format_context(docs), "question": question}
+        {"context": format_context(docs), "question": question,
+         "history": to_messages(history or [])}
     )
 
 
-def ask(question: str) -> tuple[list[Document], Iterator[str]]:
-    """Retrieve, then return (docs, token stream). Used by the CLI and the UI."""
+def ask(question: str, history: list[dict] | None = None) -> tuple[list[Document], Iterator[str]]:
+    """Retrieve, then return (docs, token stream)."""
     docs = retrieve(question)
-    return docs, stream_answer(question, docs)
+    return docs, stream_answer(question, docs, history)
