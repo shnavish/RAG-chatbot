@@ -1,11 +1,12 @@
 """Streamlit chat UI.  Run:  .venv\\Scripts\\streamlit run app.py"""
+import logging
 import time
 
 import streamlit as st
 
 from assistant import Assistant
 from chain import MissingApiKeyError
-from config import CHROMA_DIR, FALLBACK_MESSAGE, collection_counts
+from config import FALLBACK_MESSAGE, collection_counts
 from interaction_log import log_answer, log_feedback
 from refund_data import AccountStore
 from retriever import COLLECTIONS, get_merged_retriever
@@ -27,6 +28,8 @@ SAMPLE_QUESTIONS = [
     "I can't log in to the MyTelecom app.",
     "How do I download my itemised bill?",
 ]
+
+log = logging.getLogger("app")
 
 SOURCE_BADGE = {"FAQ": "📘 FAQ", "TICKET": "🎫 TICKET", "GUIDE": "📄 GUIDE"}
 
@@ -146,9 +149,10 @@ with st.sidebar:
             counts = kb_counts()
             for name, n in counts.items():
                 st.write(f"{COLLECTIONS[name]}: {n} documents")
-        except Exception as e:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             counts = {}
-            st.error(f"Could not open {CHROMA_DIR.name}/: {e}")
+            log.exception("Could not open the knowledge base")
+            st.error("Could not open the knowledge base.")
 
 kb_empty = not any(counts.values())
 
@@ -173,8 +177,9 @@ def build_knowledge_base() -> int:
 if kb_empty:
     try:
         build_knowledge_base()
-    except Exception as e:  # noqa: BLE001
-        st.error(f"Could not build the knowledge base: {e}. Run `python ingest_all.py`, then reload.")
+    except Exception:  # noqa: BLE001
+        log.exception("Could not build the knowledge base")
+        st.error("Could not build the knowledge base. Run `python ingest_all.py`, then reload.")
         st.stop()
     if not any(kb_counts().values()):
         st.error("The knowledge base is still empty after building. Run `python ingest_all.py`, then reload.")
@@ -231,10 +236,11 @@ if question:
         except MissingApiKeyError as e:
             answer = f"⚠️ {e}"
             st.markdown(answer)
-        except Exception as e:  # noqa: BLE001 - network / API failures
+        except Exception:  # noqa: BLE001 - network / API failures
+            # Details go to the server log (private to the app owner), never to visitors.
+            log.exception("Error answering a message")
             answer = f"⚠️ Sorry, something went wrong reaching the assistant. {FALLBACK_MESSAGE}"
             st.markdown(answer)
-            st.caption(f"Error: {type(e).__name__}: {e}")
 
         latency = time.perf_counter() - start
         answer = answer if isinstance(answer, str) else "".join(answer)
