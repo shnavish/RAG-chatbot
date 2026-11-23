@@ -1,3 +1,7 @@
+# CPU-only PyTorch: avoids downloading several GB of GPU libraries on Linux hosts
+# (Streamlit Community Cloud). Embeddings run on CPU anyway.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
 langchain-core>=0.3
 langchain-text-splitters>=0.3
 langchain-groq>=0.3

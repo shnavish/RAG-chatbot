@@ -160,9 +160,26 @@ st.caption(
     "MyTelecom app or call 611."
 )
 
+@st.cache_resource(show_spinner="Building the knowledge base (first start only)…")
+def build_knowledge_base() -> int:
+    """Hosted copies start without chroma_store/ (it isn't in git), so build it once."""
+    import ingest_faq
+    import ingest_guides
+    import ingest_tickets
+
+    return ingest_faq.ingest() + ingest_tickets.ingest() + ingest_guides.ingest()
+
+
 if kb_empty:
-    st.warning("The knowledge base is empty. Run `python ingest_all.py` once, then reload.")
-    st.stop()
+    try:
+        build_knowledge_base()
+    except Exception as e:  # noqa: BLE001
+        st.error(f"Could not build the knowledge base: {e}. Run `python ingest_all.py`, then reload.")
+        st.stop()
+    if not any(kb_counts().values()):
+        st.error("The knowledge base is still empty after building. Run `python ingest_all.py`, then reload.")
+        st.stop()
+    st.rerun()
 
 load_retriever()  # warm the embedding model once per server, with a visible spinner
 if st.session_state.assistant is None:

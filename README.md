@@ -31,6 +31,18 @@ Get a free Groq key at https://console.groq.com. The embedding model (about 90 M
 .venv\Scripts\python main.py
 ```
 
+## Hosting on Streamlit Community Cloud
+
+1. Sign in at https://share.streamlit.io with GitHub and click **Create app**.
+2. Choose this repository, branch `main`, main file `app.py`.
+3. Under **Advanced settings**, set Python to **3.12** and add this secret:
+   ```toml
+   GROQ_API_KEY = "your-groq-key"
+   ```
+4. Deploy. The first start installs packages and builds the knowledge base, which takes several minutes. `chroma_store/` isn't in git, so the app builds it automatically when it's missing.
+
+`requirements.txt` pulls the CPU-only build of PyTorch so the host doesn't download GPU libraries. Refunds in the demo account and the logs live in memory and on the host's temporary disk; they reset when the app restarts.
+
 ## Updating knowledge (support ops)
 
 | Change | Then run |
