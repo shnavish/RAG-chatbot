@@ -21,6 +21,7 @@ class Turn:
     docs: list = field(default_factory=list)
     trace: list[str] = field(default_factory=list)
     needs_confirmation: bool = False
+    state: str | None = None  # refund workflow state after this turn (refund route only)
 
 
 class Assistant:
@@ -78,4 +79,4 @@ class Assistant:
 
     def _refund(self, reply) -> Turn:
         return Turn(route="refund", text=reply.text, trace=reply.trace,
-                    needs_confirmation=reply.needs_confirmation)
+                    needs_confirmation=reply.needs_confirmation, state=reply.state.value)
