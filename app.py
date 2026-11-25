@@ -3,14 +3,18 @@ import html
 import logging
 import time
 
+import re
+
 import streamlit as st
+import streamlit.components.v1 as components
 
 from assistant import Assistant
 from chain import MissingApiKeyError, is_fallback
-from config import FALLBACK_MESSAGE, collection_counts
+from config import FALLBACK_MESSAGE, collection_counts, kb_version_current
 from interaction_log import log_answer, log_feedback
-from refund_data import AccountStore
-from retriever import COLLECTIONS, get_merged_retriever
+from refund_data import DEMO_USER_ID, AccountStore
+from refund_tools import _fmt, find_submission, recharge_age
+from retriever import COLLECTIONS, get_merged_retriever, relevant_sources
 
 BRAND = "NovaCell Support"
 
@@ -26,20 +30,17 @@ TOPICS = [
      ["I want a refund of ₹499.", "I want a refund."]),
 ]
 
-SAMPLE_QUESTIONS = [  # sidebar (FR-02)
-    "Why is my mobile internet so slow?",
-    "I have an unexpected charge on my bill. What is it?",
-    "How do I activate roaming before travelling abroad?",
+SAMPLE_QUESTIONS = [  # sidebar (FR-02): different from the welcome cards, so nothing repeats
     "My phone says SIM not recognised.",
     "There is an echo on my calls.",
     "I can't log in to the MyTelecom app.",
+    "I got unexpected roaming charges.",
+    "How do I contact customer support?",
 ]
 
-REFUND_SAMPLES = [
-    "I want a refund of ₹499.",
+REFUND_SAMPLES = [  # the refund scenarios the welcome cards don't cover
     "I want a refund of ₹999.",
     "Give me a refund of ₹2,000.",
-    "I want a refund.",
 ]
 
 SOURCE_STYLE = {  # source type -> (label, badge colour, icon)
@@ -112,12 +113,11 @@ def load_retriever():
 
 @st.cache_resource(show_spinner="Building the knowledge base (first start only)…")
 def build_knowledge_base() -> int:
-    """Hosted copies start without chroma_store/ (it isn't in git), so build it once."""
-    import ingest_faq
-    import ingest_guides
-    import ingest_tickets
+    """Hosted copies start without chroma_store/ (it isn't in git), and an older store is
+    rebuilt when ingestion changes (config.KB_VERSION)."""
+    from ingest_all import ingest_all
 
-    return ingest_faq.ingest() + ingest_tickets.ingest() + ingest_guides.ingest()
+    return ingest_all()
 
 
 def kb_counts() -> dict[str, int]:
@@ -160,10 +160,55 @@ def render_sources(sources: list[dict]) -> None:
             st.caption(snippet[:260] + ("…" if len(snippet) > 260 else ""))
 
 
+def friendly_step(line: str) -> str | None:
+    """Turn a workflow log line into plain language for customers (the raw line stays in
+    logs/agent.log). Returns None for steps that mean nothing to a customer."""
+    tag, _, detail = line.partition("] ")
+    tag = tag.lstrip("[")
+    amount = re.search(r"amount=([\d.]+)", detail)
+    amt = _fmt(float(amount.group(1))) if amount else ""
+    if tag == "Intent":
+        return "Understood as a refund request" if detail == "refund_request" else "Understood as a support question"
+    if tag == "Route":
+        return "Searched the FAQ, past support cases and the user guide" if "RAG" in detail else None
+    if tag == "Agent":
+        if detail.startswith("get_user_account"):
+            return "Looked up your recent recharges"
+        if detail.startswith("validate_refund"):
+            return f"Checked a {amt} refund against the refund rules"
+        if detail == "awaiting_user_confirmation":
+            return "Asked you to confirm before refunding"
+        if detail == "awaiting_amount" or detail.startswith("offered amount"):
+            return "Asked which recharge to refund"
+        if detail.startswith("process_refund"):
+            return f"Refunded {amt}"
+        if detail.startswith("submit_to_support"):
+            return f"Refunds above ₹499 go to the Support Team, so this {amt} request was passed to them"
+        if detail.startswith("pending refund replaced"):
+            return "Replaced the earlier refund request with your new one"
+        return None
+    if tag == "Validation":
+        if detail == "no eligible recharge":
+            return "Found no recharge that can be refunded right now"
+        return "Eligible for a refund" if detail.endswith("True") else "Not eligible for a refund"
+    if tag == "User":
+        return {"confirmed": "You confirmed", "cancelled": "You cancelled",
+                "ambiguous confirmation": "Waited for a clear confirm or cancel"}.get(
+            detail, "You chose an option" if detail.startswith(("accepted", "declined")) else None)
+    if tag == "Refund":
+        return "Refund completed" if detail == "success" else "The refund could not be completed"
+    if tag == "Support":
+        return "Found the request already with the Support Team" if detail.startswith("already") else None
+    if tag == "Guard":
+        return "Ignored an amount you didn't actually mention"
+    return None
+
+
 def render_trace(trace: list[str]) -> None:
-    if trace:
+    steps = [s for s in (friendly_step(line) for line in trace) if s]
+    if steps:
         with st.expander("How this was handled", icon=":material/account_tree:"):
-            st.code("\n".join(trace), language=None)
+            st.markdown("\n".join(f"{n}. {s}" for n, s in enumerate(steps, 1)))
 
 
 def on_feedback(key: str, interaction_id: str) -> None:
@@ -187,7 +232,14 @@ def render_confirm_buttons(index: int) -> None:
                   on_click=set_action, args=("cancel",))
 
 
-def render_refund_card(msg: dict, show_buttons: bool, index: int) -> None:
+def render_choices(choices: list[str], index: int) -> None:
+    """Quick replies, e.g. which recharge to refund."""
+    with st.container(horizontal=True):
+        for c in choices:
+            st.button(c, key=f"choice_{index}_{c}", on_click=ask, args=(c,))
+
+
+def render_refund_card(msg: dict, show_buttons: bool, show_choices: bool, index: int) -> None:
     with st.container(border=True):
         status = REFUND_STATUS.get(msg.get("refund_state") or "")
         if status:
@@ -196,16 +248,32 @@ def render_refund_card(msg: dict, show_buttons: bool, index: int) -> None:
         st.markdown(msg["content"])
         if show_buttons:
             render_confirm_buttons(index)
+        if show_choices:
+            render_choices(msg["choices"], index)
 
 
-def render_assistant_body(msg: dict, show_buttons: bool, index: int) -> None:
+def render_pending_reminder(index: int) -> None:
+    """A refund is still waiting for confirmation after the customer asked something else."""
+    pending = st.session_state.assistant.agent.pending or {}
+    with st.container(border=True):
+        st.markdown(f":blue-badge[:material/pending_actions: Confirmation needed] Your refund of "
+                    f"{_fmt(pending.get('amount', 0))} is still waiting for your go-ahead.")
+        render_confirm_buttons(index)
+
+
+def render_assistant_body(msg: dict, index: int, is_last: bool) -> None:
+    agent = st.session_state.assistant.agent
     if msg.get("error"):
         st.warning(msg["content"].removeprefix("⚠️").strip(), icon=":material/error:")
     elif msg.get("route") == "refund":
-        render_refund_card(msg, show_buttons, index)
+        render_refund_card(msg, show_buttons=is_last and msg.get("confirm") and agent.awaiting_confirmation,
+                           show_choices=is_last and bool(msg.get("choices")) and agent.awaiting_amount,
+                           index=index)
     else:
         st.markdown(msg["content"])
     render_sources(msg.get("sources", []))
+    if is_last and agent.awaiting_confirmation and msg.get("route") != "refund":
+        render_pending_reminder(index)
     render_trace(msg.get("trace", []))
     render_feedback(msg)
 
@@ -224,8 +292,8 @@ def welcome() -> None:
     st.html("""
     <div class="nc-hero">
       <h2>How can we help today?</h2>
-      <p>Ask about mobile data, billing, SIM and eSIM, roaming, calls or the MyTelecom app,
-         or request a refund for a recent recharge.</p>
+      <p>Ask about mobile data, billing, SIM and eSIM, roaming, calls or the MyTelecom app.
+         I can also refund a recent recharge.</p>
     </div>""")
     cols = st.columns(2)
     for i, (icon, title, desc, questions) in enumerate(TOPICS):
@@ -235,7 +303,29 @@ def welcome() -> None:
             for q in questions:
                 st.button(q, key=f"topic_{i}_{q}", type="tertiary", icon=":material/arrow_forward:",
                           on_click=ask, args=(q,))
-    st.caption("I can't see your account balance or bill. For those, use the MyTelecom app or call 611.")
+    st.caption("I can see your recent recharges for refunds, but not your bill, usage or data balance. "
+               "For those, use the MyTelecom app or call 611.")
+    # Chat apps open scrolled to the bottom; on the welcome screen, start at the top instead.
+    # Chat apps scroll inside Streamlit's "stick to bottom" container, which only lets go of the
+    # bottom when it sees the user scroll up; otherwise any later resize (fonts loading, a phone's
+    # address bar) snaps it back down. So signal a scroll-up and move to the top, repeating while
+    # the layout settles, and stop at the visitor's first real scroll, tap or keypress.
+    components.html("""<script>{  // block scope: no clashes with browser globals such as window.top
+      const d = window.parent.document, W = window.parent;
+      const toTop = () => {
+        for (const el of d.querySelectorAll('[data-testid="stAppScrollToBottomContainer"]')) {
+          el.dispatchEvent(new W.WheelEvent('wheel', {deltaY: -1000, bubbles: true}));
+          el.scrollTop = 0;
+        }
+      };
+      const events = ['wheel', 'touchstart', 'pointerdown', 'keydown'];
+      const stop = (e) => { if (e && !e.isTrusted) return;  // ignore our own simulated scroll
+        clearInterval(timer); for (const ev of events) d.removeEventListener(ev, stop, true); };
+      for (const ev of events) d.addEventListener(ev, stop, true);
+      const timer = setInterval(toTop, 150);
+      setTimeout(() => stop(), 6000);
+      toTop();
+    }</script>""", height=0)
 
 
 # ---------- session state ----------
@@ -259,8 +349,9 @@ def new_conversation() -> None:  # FR-04, agent FR-48: clears history and any pe
 
 
 def reset_demo_account() -> None:
+    """Restore the demo account AND start a new chat, so the two never contradict each other."""
     st.session_state.store = AccountStore()
-    st.session_state.assistant = None
+    new_conversation()
 
 
 # ---------- sidebar ----------
@@ -271,28 +362,33 @@ with st.sidebar:
     st.button("New conversation", icon=":material/add_comment:", type="primary", width="stretch",
               on_click=new_conversation)
 
-    st.html('<div class="nc-label">Suggested questions</div>')
-    for q in SAMPLE_QUESTIONS:
-        st.button(q, key=f"side_{q}", type="tertiary", on_click=ask, args=(q,))
-
-    st.html('<div class="nc-label">Try a refund</div>')
-    for q in REFUND_SAMPLES:
-        st.button(q, key=f"refund_{q}", type="tertiary", on_click=ask, args=(q,))
-
     st.html('<div class="nc-label">Your account</div>')
     with st.container(border=True):
-        user = st.session_state.store.get_user("user_123")
+        store = st.session_state.store
+        user = store.get_user(DEMO_USER_ID)
         st.markdown(f"**{user['name']}** · {user['plan']} plan")
         st.caption("Demo account with simulated data")
         for r in user["recharges"]:
-            refunded = r["refund_status"] == "refunded"
-            badge = ":green-badge[Refunded]" if refunded else ":gray-badge[Not refunded]"
-            days = r["recharge_age_days"]
+            if r["refund_status"] == "refunded":
+                badge = ":green-badge[Refunded]"
+            elif find_submission(store, DEMO_USER_ID, r["recharge_id"]):
+                badge = ":orange-badge[Under review]"
+            else:
+                badge = ":gray-badge[Not refunded]"
             st.markdown(f"₹{r['recharge_amount']:,} recharge &nbsp;{badge}  \n"
-                        f"<span style='opacity:.6;font-size:.8rem'>{days} day{'s' if days != 1 else ''} ago · "
-                        f"{r['recharge_id']}</span>", unsafe_allow_html=True)
+                        f"<span style='opacity:.6;font-size:.8rem'>Recharged {recharge_age(r)}</span>",
+                        unsafe_allow_html=True)
         st.button("Reset demo data", icon=":material/restart_alt:", type="tertiary",
+                  help="Restores the demo account and starts a new conversation.",
                   on_click=reset_demo_account)
+
+    st.html('<div class="nc-label">More questions</div>')
+    for q in SAMPLE_QUESTIONS:
+        st.button(q, key=f"side_{q}", type="tertiary", on_click=ask, args=(q,))
+
+    st.html('<div class="nc-label">More refund scenarios</div>')
+    for q in REFUND_SAMPLES:
+        st.button(q, key=f"refund_{q}", type="tertiary", on_click=ask, args=(q,))
 
     try:
         counts = kb_counts()
@@ -306,21 +402,23 @@ with st.sidebar:
     else:
         st.caption("Answers come only from NovaCell's FAQ, resolved cases and user guides.")
 
-kb_empty = not any(counts.values())
+needs_build = not any(counts.values()) or not kb_version_current()
 
 # ---------- main ----------
 header()
 
-if kb_empty:
+if needs_build:
     try:
         build_knowledge_base()
     except Exception:  # noqa: BLE001
         log.exception("Could not build the knowledge base")
         st.error("Could not build the knowledge base. Run `python ingest_all.py`, then reload.")
         st.stop()
-    if not any(kb_counts().values()):
-        st.error("The knowledge base is still empty after building. Run `python ingest_all.py`, then reload.")
+    if not any(kb_counts().values()) or not kb_version_current():
+        st.error("The knowledge base could not be prepared. Run `python ingest_all.py`, then reload.")
         st.stop()
+    load_retriever.clear()  # the rebuilt collections replace the ones a cached retriever points at
+    st.session_state.assistant = None
     st.rerun()
 
 load_retriever()  # warm the embedding model once per server, with a visible spinner
@@ -345,9 +443,7 @@ for i, msg in enumerate(messages):  # FR-03
         if msg["role"] == "user":
             st.markdown(msg["content"])
         else:
-            show_buttons = (msg.get("confirm") and i == len(messages) - 1
-                            and assistant.agent.awaiting_confirmation and not question)
-            render_assistant_body(msg, bool(show_buttons), i)
+            render_assistant_body(msg, i, is_last=(i == len(messages) - 1 and not question))
 
 if question:
     history = list(messages)  # earlier messages, before this one (agent FR-46)
@@ -368,9 +464,10 @@ if question:
             if turn.route == "rag":
                 answer = st.write_stream(turn.stream)  # FR-05
                 answer = answer if isinstance(answer, str) else "".join(answer)
-                # Sources show what an answer was based on; a "can't answer" reply used none.
+                # Sources show what the answer was based on: none for a "can't answer" reply,
+                # otherwise only the retrieved documents the answer actually drew on.
                 if not is_fallback(answer):
-                    sources = to_sources(turn.docs)
+                    sources = to_sources(relevant_sources(answer, turn.docs))
             else:
                 answer = turn.text  # shown as a card after the rerun below
         except MissingApiKeyError as e:
@@ -384,12 +481,13 @@ if question:
         answer = answer if isinstance(answer, str) else "".join(answer)
         msg = {"role": "assistant", "content": answer, "sources": sources, "trace": trace,
                "route": turn.route if turn else None, "refund_state": turn.state if turn else None,
-               "confirm": bool(turn and turn.needs_confirmation), "error": error}
+               "confirm": bool(turn and turn.needs_confirmation), "error": error,
+               "choices": turn.choices if turn else []}
         if turn and not error:
             msg["id"] = log_answer(question, answer, sources, latency, channel="web", route=turn.route)
         messages.append(msg)
-        if error or turn.route == "refund":
-            st.rerun()  # redraw: refund cards, confirm buttons and the account panel reflect the new state
+        if error or turn.route == "refund" or assistant.agent.awaiting_confirmation:
+            st.rerun()  # redraw: refund cards, buttons, reminders and the account panel reflect the new state
         render_sources(sources)
         render_trace(trace)
         render_feedback(msg)

@@ -6,7 +6,7 @@ collection, then add one entry to COLLECTIONS below.
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnableParallel
 
-from config import TOP_K, get_store
+from config import TOP_K, get_embeddings, get_store
 
 # collection name -> label used in the prompt context
 COLLECTIONS = {
@@ -34,6 +34,31 @@ def retrieve(question: str, retriever: RunnableParallel | None = None) -> list[D
     for name in COLLECTIONS:
         docs.extend(results.get(name, []))
     return docs
+
+
+SOURCE_MIN_SCORE = 0.55  # answer-to-document similarity a source needs to be shown
+SOURCE_MAX_GAP = 0.25  # ...and it must be within this much of the best-matching document
+SOURCE_MAX_SHOWN = 5
+
+
+def relevant_sources(answer: str, docs: list[Document]) -> list[Document]:
+    """The retrieved documents the answer actually drew on, best first.
+
+    All 9 retrieved documents go to the model (FR-07), but showing all 9 to the customer
+    pads the list with near-misses. A document is shown when its text is similar to the
+    final answer: a score of at least SOURCE_MIN_SCORE and within SOURCE_MAX_GAP of the
+    best one. The best match is always kept.
+    """
+    if not docs or not answer.strip():
+        return []
+    emb = get_embeddings()  # normalised vectors, so the dot product is cosine similarity
+    a = emb.embed_query(answer)
+    scores = [sum(x * y for x, y in zip(a, d)) for d in emb.embed_documents([d.page_content for d in docs])]
+    ranked = sorted(zip(scores, range(len(docs))), reverse=True)
+    best = ranked[0][0]
+    cutoff = max(SOURCE_MIN_SCORE, best - SOURCE_MAX_GAP)
+    keep = [i for s, i in ranked if s >= cutoff] or [ranked[0][1]]
+    return [docs[i] for i in keep[:SOURCE_MAX_SHOWN]]
 
 
 def format_context(docs: list[Document]) -> str:

@@ -51,6 +51,8 @@ Get a free Groq key at https://console.groq.com. The embedding model (about 90 M
 | Add resolved tickets to `data/tickets.db` | `.venv\Scripts\python ingest_tickets.py` |
 | Replace `data/telecom_guide.pdf` | `.venv\Scripts\python ingest_guides.py` |
 
+If you change how documents are indexed (for example in `ingest_guides.py`), bump `KB_VERSION` in `config.py`: the app then rebuilds `chroma_store/` by itself on its next start, including on the host.
+
 Ingest scripts can safely be re-run: each one rebuilds its collection in `chroma_store/`. Only tickets with `status = 'resolved'` are indexed. The app does not re-ingest when it starts.
 
 To add a new source, write an `ingest_<name>.py` that fills a Chroma collection, then add the collection to `COLLECTIONS` in [retriever.py](retriever.py).

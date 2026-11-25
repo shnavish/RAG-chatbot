@@ -102,8 +102,16 @@ def run():
         a, h = session(), []
         t1, ans1 = say(a, h, "I want a refund.")
         t2, _ = say(a, h, "The 499 one")
-        check("missing amount", "₹999 and ₹499" in ans1 and t2.needs_confirmation and spy.call_count == 0,
-              f"asked which={'₹999 and ₹499' in ans1}, then confirmation={t2.needs_confirmation}")
+        asked = "₹999" in ans1 and "₹499" in ans1 and t1.choices == ["₹999", "₹499"]
+        check("missing amount", asked and t2.needs_confirmation and spy.call_count == 0,
+              f"asked which={asked}, then confirmation={t2.needs_confirmation}")
+
+        print("Extra - asking twice for ₹999 doesn't create a second Support Team request")
+        a, h = session(), []
+        say(a, h, "I want a refund of ₹999.")
+        _, ans = say(a, h, "I want a refund of ₹999.")
+        check("no duplicate support request", len(a.store.support_submissions) == 1 and "already" in ans,
+              f"submissions={len(a.store.support_submissions)}")
 
         print("Extra - question about cancelling is an inquiry (FR-05a)")
         a, h = session(), []

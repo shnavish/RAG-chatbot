@@ -21,8 +21,10 @@ from refund_tools import (
     APPROVAL_LIMIT,
     _fmt,
     eligible_recharges,
+    find_submission,
     get_user_account,
     process_refund,
+    recharge_phrase,
     submit_to_support,
     validate_refund,
 )
@@ -52,6 +54,7 @@ class AgentReply:
     state: RefundState
     needs_confirmation: bool = False
     trace: list[str] = field(default_factory=list)
+    choices: list[str] = field(default_factory=list)  # quick replies the UI shows as buttons
 
 
 # ---------- deterministic parsing helpers ----------
@@ -78,22 +81,35 @@ def _norm(text: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9 ]", " ", text.lower().replace("'", "")).split())
 
 
-_YES = {"yes", "y", "yes proceed", "proceed", "yes please", "yes please proceed", "confirm",
-        "confirm refund", "yes confirm", "yes confirm refund", "go ahead", "yes go ahead",
-        "yes do it", "yes refund", "yes refund it", "yes process it", "please proceed",
-        "yes i confirm", "i confirm", "confirmed"}
-_NO = {"no", "n", "cancel", "no cancel", "no thanks", "no thank you", "nope", "stop",
-       "dont", "do not", "dont proceed", "do not proceed", "no dont", "cancel refund",
-       "cancel it", "no cancel it", "no dont proceed", "never mind", "nevermind"}
+# A reply counts as a clear yes (or no) only if it contains a decisive word AND every other
+# word is harmless filler. "sure, go ahead" and "yes please" pass; "ok", "ok thanks",
+# "maybe", "yes but not now" and anything ending in "?" stay ambiguous (FR-36c, FR-36e).
+_YES_STRONG = {"yes", "yeah", "yep", "yup", "sure", "proceed", "confirm", "confirmed", "y"}
+_YES_PHRASES = ("go ahead", "do it", "go for it")
+_YES_ALLOWED = _YES_STRONG | {"ok", "okay", "please", "go", "ahead", "do", "it", "for", "i", "refund",
+                              "that", "thats", "fine", "thanks", "thank", "you", "good", "sounds",
+                              "and", "the", "with", "process", "submit", "now"}
+_NO_STRONG = {"no", "nope", "nah", "cancel", "stop", "dont", "not", "nevermind", "n"}
+_NO_PHRASES = ("never mind",)
+_NO_ALLOWED = _NO_STRONG | {"thanks", "thank", "you", "please", "it", "the", "refund", "proceed", "i",
+                            "do", "want", "to", "need", "changed", "my", "mind", "never", "ok",
+                            "okay", "that", "this", "go", "ahead", "with"}
 
 
 def parse_confirmation(text: str) -> bool | None:
-    """True = explicit yes, False = explicit no, None = anything else (ambiguous, FR-36e)."""
+    """True = clear yes, False = clear no, None = anything else (ask again)."""
+    if text.strip().endswith("?"):
+        return None
     t = _norm(text)
-    if t in _YES:
-        return True
-    if t in _NO:
+    words = set(t.split())
+    if not words:
+        return None
+    no_signal = bool(words & _NO_STRONG) or any(p in t for p in _NO_PHRASES)
+    yes_signal = bool(words & _YES_STRONG) or any(p in t for p in _YES_PHRASES)
+    if no_signal and words <= _NO_ALLOWED:  # "don't proceed": the negation wins (and refunds nothing)
         return False
+    if yes_signal and not no_signal and words <= _YES_ALLOWED:
+        return True
     return None
 
 
@@ -183,8 +199,8 @@ class RefundAgent:
         if result["success"]:
             step(trace, "Refund", "success")
             self.state = RefundState.REFUND_PROCESSED
-            text = (f"Your refund of {_fmt(result['amount'])} for recharge {result['recharge_id']} "
-                    f"has been processed. Refund reference: **{result['refund_id']}**.\n\n"
+            text = (f"Your refund of {_fmt(result['amount'])} has been processed. "
+                    f"Refund reference: **{result['refund_id']}**.\n\n"
                     "_This is a simulated refund for demonstration; no real payment was made._")
         else:
             step(trace, "Refund", f"failed: {result['reason']}")
@@ -197,8 +213,9 @@ class RefundAgent:
         step(trace, "User", "ambiguous confirmation")
         amount = _fmt(self.pending["amount"]) if self.pending else "this refund"
         return AgentReply(
-            f"I need a clear answer before I make any refund. Do you want to proceed with the "
-            f"refund of {amount}? Reply **Yes, proceed** or **Cancel**.",
+            f"Just to check: your refund of {amount} is still waiting for your go-ahead, and "
+            f"nothing has been refunded yet. Choose **Confirm refund** to go ahead, or **Cancel** "
+            f"to drop it.",
             self.state, needs_confirmation=True, trace=trace)
 
     # ----- internals -----
@@ -291,30 +308,42 @@ class RefundAgent:
 
         self.state = RefundState.REFUND_VALIDATED
         requested = float(result["requested_amount"])
+        recharge = self._recharge(result["recharge_id"])
         if requested <= APPROVAL_LIMIT:  # FR-36a: limit enforced in code
             self.pending = {"amount": requested, "recharge_id": result["recharge_id"]}
             self.state = RefundState.AWAITING_CONFIRMATION
             step(trace, "Agent", "awaiting_user_confirmation")
             partial = ""
             if requested < result["recharge_amount"]:
-                partial = (f"\n\nNote: this closes the whole {_fmt(result['recharge_amount'])} recharge; "
-                           "the remaining balance can't be refunded later.")
+                partial = (f" This closes the whole {_fmt(result['recharge_amount'])} recharge, so the "
+                           "rest of it can't be refunded later.")
             return AgentReply(
-                f"{offered_text}**Refund eligible: {_fmt(requested)}** "
-                f"(recharge {result['recharge_id']}).{partial}\n\n"
+                f"{offered_text}**Refund eligible: {_fmt(requested)}**\n\n"
+                f"This refunds {recharge_phrase(recharge)}.{partial}\n\n"
                 "Do you want to proceed with this refund?",
                 self.state, needs_confirmation=True, trace=trace)
 
         # Above the limit: never processed here (FR-37, FR-39, GR-08).
         step(trace, "Agent", f"submit_to_support(amount={requested:g})")
         submission = submit_to_support(self.store, self.user_id, requested, result["recharge_id"])
-        step(trace, "Support", f"submitted {submission['submission_id']}")
         self.state = RefundState.REFUND_SUBMITTED_FOR_REVIEW
+        if submission["already_submitted"]:  # one request per recharge, no duplicates
+            step(trace, "Support", f"already submitted {submission['submission_id']}")
+            return AgentReply(
+                f"A refund request for {recharge_phrase(recharge)} is already with our Support Team "
+                f"(request reference: {submission['submission_id']}), so there's no need to submit it "
+                "again. They will review the request and process it or take the necessary action.",
+                self.state, trace=trace)
+        step(trace, "Support", f"submitted {submission['submission_id']}")
         return AgentReply(
             f"Your refund request for {_fmt(requested)} has been submitted to our Support Team "
             f"(request reference: {submission['submission_id']}). They will review the request "
             "and process it or take the necessary action.",
             self.state, trace=trace)
+
+    def _recharge(self, recharge_id: str) -> dict:
+        user = self.store.get_user(self.user_id)
+        return next(r for r in user["recharges"] if r["recharge_id"] == recharge_id)
 
     def _no_amount(self, stated: list[float], trace: list[str]) -> AgentReply:
         if len(set(stated)) > 1:  # several numbers and the model didn't pick one
@@ -322,20 +351,27 @@ class RefundAgent:
             step(trace, "Agent", "awaiting_amount")
             return AgentReply("Which amount would you like refunded?", self.state, trace=trace)
 
-        eligible = eligible_recharges(self.store, self.user_id)
+        # Recharges already with the Support Team aren't offered again.
+        eligible = [r for r in eligible_recharges(self.store, self.user_id)
+                    if not find_submission(self.store, self.user_id, r["recharge_id"])]
         if not eligible:
             self.state = RefundState.REFUND_REJECTED
             step(trace, "Validation", "no eligible recharge")
             account = get_user_account(self.store, self.user_id)
-            reasons = [validate_refund(self.store, self.user_id, r["recharge_amount"])["reason"]
-                       for r in account["recharges"]]
+            reasons = []
+            for r in account["recharges"]:
+                pending = find_submission(self.store, self.user_id, r["recharge_id"])
+                reasons.append(
+                    f"A refund request for {recharge_phrase(r)} is already with our Support Team "
+                    f"(reference {pending['submission_id']})." if pending
+                    else validate_refund(self.store, self.user_id, r["recharge_amount"])["reason"])
             listed = "\n".join(f"- {r}" for r in reasons) or "- There are no recharges on your account."
-            return AgentReply("I couldn't find a recent recharge that is eligible for a refund:\n\n" + listed,
+            return AgentReply("I couldn't find a recent recharge that can be refunded right now:\n\n" + listed,
                               self.state, trace=trace)
 
         if len(eligible) == 1:  # FR-42: offer the single eligible amount
             amount = float(eligible[0]["recharge_amount"])
-            intro = f"I can see one recent recharge eligible for a refund: {_fmt(amount)}.\n\n"
+            intro = f"I can see one recent recharge eligible for a refund: {recharge_phrase(eligible[0])}.\n\n"
             if amount <= APPROVAL_LIMIT:
                 return self._validate_and_route(amount, trace, offered_text=intro)
             self.offer = amount
@@ -344,14 +380,15 @@ class RefundAgent:
             return AgentReply(
                 f"{intro}Refunds above {_fmt(APPROVAL_LIMIT)} are reviewed by our Support Team. "
                 f"Would you like me to submit a refund request for {_fmt(amount)}?",
-                self.state, trace=trace)
+                self.state, trace=trace, choices=["Yes", "No"])
 
         # FR-42a: several eligible recharges -> ask which
         self.state = RefundState.AWAITING_AMOUNT
         step(trace, "Agent", "awaiting_amount")
-        amounts = " and ".join(_fmt(r["recharge_amount"]) for r in eligible)
-        return AgentReply(f"I can see more than one recent recharge - {amounts}.\n"
-                          "Which amount would you like refunded?", self.state, trace=trace)
+        listed = "\n".join(f"- {recharge_phrase(r)[0].upper()}{recharge_phrase(r)[1:]}" for r in eligible)
+        return AgentReply(f"I can see more than one recent recharge:\n\n{listed}\n\n"
+                          "Which amount would you like refunded?", self.state, trace=trace,
+                          choices=[_fmt(r["recharge_amount"]) for r in eligible])
 
     def _resolve_offer(self, accepted: bool, trace: list[str]) -> AgentReply:
         amount, self.offer = self.offer, None

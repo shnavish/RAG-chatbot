@@ -80,11 +80,12 @@ class ValidationRules(unittest.TestCase):
 
 class Confirmation(unittest.TestCase):
     def test_parse(self):
-        for yes in ["Yes, proceed", "yes", "Confirm", "Go ahead"]:
+        for yes in ["Yes, proceed", "yes", "Confirm", "Go ahead", "sure, go ahead", "yes please", "Yep"]:
             self.assertIs(parse_confirmation(yes), True, yes)
-        for no in ["No", "Cancel", "don't proceed"]:
+        for no in ["No", "Cancel", "don't proceed", "no thanks", "never mind", "I don't want to proceed"]:
             self.assertIs(parse_confirmation(no), False, no)
-        for unclear in ["maybe", "ok", "sure?", "yes but not now", "I want a refund of ₹499."]:
+        for unclear in ["maybe", "ok", "ok thanks", "sure?", "yes but not now", "I want a refund of ₹499.",
+                        "yes no", "₹499"]:
             self.assertIsNone(parse_confirmation(unclear), unclear)
 
 
@@ -150,10 +151,48 @@ class AgentFlows(unittest.TestCase):
         agent = make_agent(AccountStore())
         reply = agent.handle("I want a refund.")
         self.assertEqual(agent.state, RefundState.AWAITING_AMOUNT)
-        self.assertIn("₹999 and ₹499", reply.text)
+        self.assertIn("₹999", reply.text)
+        self.assertIn("₹499", reply.text)
+        self.assertEqual(reply.choices, ["₹999", "₹499"])  # quick-reply buttons
         agent._planner = fake_planner(499)
-        reply = agent.handle("₹499")
+        reply = agent.handle("₹499")  # what tapping the ₹499 button sends
         self.assertTrue(reply.needs_confirmation)
+
+    def test_duplicate_support_request_is_not_resubmitted(self):
+        store = AccountStore()
+        first = make_agent(store, 999).handle("I want a refund of ₹999.")
+        second = make_agent(store, 999).handle("I want a refund of ₹999.")
+        self.assertEqual(len(store.support_submissions), 1)
+        ref = store.support_submissions[0]["submission_id"]
+        self.assertIn(ref, first.text)
+        self.assertIn("already with our Support Team", second.text)
+        self.assertIn(ref, second.text)
+
+    def test_recharge_under_review_is_not_offered_again(self):
+        store = AccountStore()
+        make_agent(store, 999).handle("I want a refund of ₹999.")
+        reply = make_agent(store).handle("I want a refund.")
+        self.assertTrue(reply.needs_confirmation)  # only the ₹499 recharge is left to offer
+        self.assertIn("₹499", reply.text)
+
+    def test_ambiguous_reply_keeps_refund_pending_with_clear_message(self):
+        agent = make_agent(AccountStore(), 499)
+        agent.handle("I want a refund of ₹499.")
+        reply = agent.handle("ok thanks")
+        self.assertTrue(reply.needs_confirmation)
+        self.assertIn("nothing has been refunded yet", reply.text)
+        self.assertEqual(agent.state, RefundState.AWAITING_CONFIRMATION)
+
+    def test_customer_messages_have_no_internal_recharge_ids(self):
+        store = AccountStore()
+        texts = [make_agent(store, 499).handle("I want a refund of ₹499.").text,
+                 make_agent(store_with(rch_457={"recharge_age_days": 15}), 499).handle("refund ₹499").text,
+                 make_agent(store_with(rch_457={"refund_status": "refunded"}), 499).handle("refund ₹499").text]
+        agent = make_agent(AccountStore(), 499)
+        agent.handle("I want a refund of ₹499.")
+        texts.append(agent.handle("Yes, proceed").text)
+        for t in texts:
+            self.assertNotIn("rch_", t, t)
 
     def test_missing_amount_single_eligible_offers_it(self):
         agent = make_agent(store_with(rch_456={"refund_status": "refunded"}))

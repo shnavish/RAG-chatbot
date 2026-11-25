@@ -1,4 +1,6 @@
 """Chunk data/telecom_guide.pdf (600 chars, 100 overlap) into the `guides` collection (FR-16)."""
+import re
+
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pypdf import PdfReader
@@ -8,11 +10,20 @@ from config import CHUNK_OVERLAP, CHUNK_SIZE, GUIDE_PDF, rebuild_collection
 COLLECTION = "guides"
 
 
+# Repeated page header in the PDF ("Telecom Technical Reference Guide - Internal Use Only").
+# It's not content, and customers shouldn't see it in source snippets.
+HEADER_RE = re.compile(r"^\s*Telecom Technical Reference Guide\s*-\s*Internal Use Only\s*$", re.I | re.M)
+
+
+def clean_page(text: str) -> str:
+    return HEADER_RE.sub("", text or "").strip()
+
+
 def load_docs():
     reader = PdfReader(str(GUIDE_PDF))
     pages = [
         Document(
-            page_content=(page.extract_text() or "").strip(),
+            page_content=clean_page(page.extract_text()),
             metadata={"page": i + 1},
         )
         for i, page in enumerate(reader.pages)

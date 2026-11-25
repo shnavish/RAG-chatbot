@@ -26,18 +26,29 @@ def get_user_account(store: AccountStore, user_id: str) -> dict:
     return {"found": True, "user_id": user_id, **copy.deepcopy(user)}
 
 
+def recharge_age(recharge: dict) -> str:
+    days = recharge["recharge_age_days"]
+    return "today" if days == 0 else "yesterday" if days == 1 else f"{days} days ago"
+
+
+def recharge_phrase(recharge: dict) -> str:
+    """Customer-facing description, e.g. 'your ₹499 recharge from yesterday' (no internal IDs)."""
+    age = recharge_age(recharge)
+    return f"your {_fmt(recharge['recharge_amount'])} recharge {'from ' if age != 'today' else ''}{age}"
+
+
 def _rule_failure(recharge: dict, amount: float) -> str | None:
     """First failing rule for this recharge, or None if eligible (FR-24 .. FR-28)."""
+    amt = _fmt(recharge["recharge_amount"])
     if recharge["recharge_status"] != "completed":
-        return f"The recharge {recharge['recharge_id']} is not completed (status: {recharge['recharge_status']})."
+        return f"Your {amt} recharge isn't completed yet (status: {recharge['recharge_status']})."
     if recharge["recharge_age_days"] > REFUND_WINDOW_DAYS:
-        return (f"The recharge {recharge['recharge_id']} was made {recharge['recharge_age_days']} days ago, "
+        return (f"Your {amt} recharge was made {recharge['recharge_age_days']} days ago, "
                 f"outside the {REFUND_WINDOW_DAYS}-day refund window.")
     if recharge["refund_status"] == "refunded":
-        return f"The recharge {recharge['recharge_id']} of {_fmt(recharge['recharge_amount'])} has already been refunded."
+        return f"Your {amt} recharge has already been refunded."
     if amount > recharge["recharge_amount"]:
-        return (f"The requested amount {_fmt(amount)} exceeds the recharge amount "
-                f"{_fmt(recharge['recharge_amount'])}.")
+        return f"The requested amount {_fmt(amount)} exceeds the recharge amount {amt}."
     return None
 
 
@@ -122,13 +133,24 @@ def process_refund(store: AccountStore, user_id: str, amount: float) -> dict:
             "recharge_id": recharge["recharge_id"], "status": "refunded"}
 
 
+def find_submission(store: AccountStore, user_id: str, recharge_id: str | None) -> dict | None:
+    """An existing Support Team request for this recharge, if one was already submitted."""
+    return next((s for s in store.support_submissions
+                 if s["user_id"] == user_id and s["recharge_id"] == recharge_id), None)
+
+
 def submit_to_support(store: AccountStore, user_id: str, amount: float, recharge_id: str | None = None) -> dict:
     """FR-21a, FR-38: hand an above-limit request to the Support Team. Refund status is unchanged.
 
+    One request per recharge: asking again returns the existing request instead of a duplicate.
     The Support Team's review is outside this application and is never simulated (GR-09).
     """
+    existing = find_submission(store, user_id, recharge_id)
+    if existing:
+        return {"submitted": False, "already_submitted": True, "submission_id": existing["submission_id"],
+                "amount": existing["amount"], "recharge_id": recharge_id, "status": "submitted_for_review"}
     submission_id = f"sup_{uuid.uuid4().hex[:8]}"
     store.support_submissions.append({"submission_id": submission_id, "user_id": user_id,
                                       "amount": amount, "recharge_id": recharge_id})
-    return {"submitted": True, "submission_id": submission_id, "amount": amount,
-            "recharge_id": recharge_id, "status": "submitted_for_review"}
+    return {"submitted": True, "already_submitted": False, "submission_id": submission_id,
+            "amount": amount, "recharge_id": recharge_id, "status": "submitted_for_review"}
