@@ -6,7 +6,7 @@ import time
 import streamlit as st
 
 from assistant import Assistant
-from chain import MissingApiKeyError
+from chain import MissingApiKeyError, is_fallback
 from config import FALLBACK_MESSAGE, collection_counts
 from interaction_log import log_answer, log_feedback
 from refund_data import AccountStore
@@ -366,8 +366,11 @@ if question:
                 turn = assistant.confirm(action == "confirm") if action else assistant.handle(question, history)
             trace = turn.trace
             if turn.route == "rag":
-                sources = to_sources(turn.docs)
                 answer = st.write_stream(turn.stream)  # FR-05
+                answer = answer if isinstance(answer, str) else "".join(answer)
+                # Sources show what an answer was based on; a "can't answer" reply used none.
+                if not is_fallback(answer):
+                    sources = to_sources(turn.docs)
             else:
                 answer = turn.text  # shown as a card after the rerun below
         except MissingApiKeyError as e:

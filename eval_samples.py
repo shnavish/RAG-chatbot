@@ -6,7 +6,7 @@ Usage:  python eval_samples.py            (retrieval + generation, needs GROQ_AP
 import sys
 import time
 
-from chain import stream_answer  # fallback text is config.FALLBACK_MESSAGE
+from chain import is_fallback, stream_answer
 from retriever import get_merged_retriever, retrieve
 
 SAMPLES = [
@@ -53,7 +53,7 @@ def main() -> None:
             parts.append(tok)
         answer = "".join(parts)
         total = time.perf_counter() - start
-        fallback = "don't have enough information" in answer
+        fallback = is_fallback(answer)
         answered += not fallback
         flag = "FALLBACK" if fallback else "ANSWERED"
         print(f"[{flag}] {q}  (first token {first or 0:.1f}s, total {total:.1f}s)")

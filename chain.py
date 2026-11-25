@@ -60,6 +60,12 @@ def to_messages(history: list[dict]) -> list[BaseMessage]:
     return out
 
 
+def is_fallback(answer: str) -> bool:
+    """True when the model declined to answer (FR-11), i.e. no source was actually used."""
+    text = answer.replace("’", "'").lower()  # the model may use a curly apostrophe
+    return "don't have enough information" in text
+
+
 class MissingApiKeyError(RuntimeError):
     pass
 
