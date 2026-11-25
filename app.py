@@ -305,25 +305,31 @@ def welcome() -> None:
                           on_click=ask, args=(q,))
     st.caption("I can see your recent recharges for refunds, but not your bill, usage or data balance. "
                "For those, use the MyTelecom app or call 611.")
-    # Chat apps open scrolled to the bottom; on the welcome screen, start at the top instead.
-    # Chat apps scroll inside Streamlit's "stick to bottom" container, which only lets go of the
-    # bottom when it sees the user scroll up; otherwise any later resize (fonts loading, a phone's
-    # address bar) snaps it back down. So signal a scroll-up and move to the top, repeating while
-    # the layout settles, and stop at the visitor's first real scroll, tap or keypress.
+    # Chat apps open scrolled to the bottom, inside Streamlit's "stick to bottom" container, and
+    # any resize (fonts loading, a phone's address bar showing or hiding) snaps it back down.
+    # While the welcome screen is showing, put it back at the top whenever that happens, until
+    # the visitor first scrolls, taps or types. This script lives in the welcome screen, so it
+    # goes away by itself as soon as a conversation starts.
     components.html("""<script>{  // block scope: no clashes with browser globals such as window.top
       const d = window.parent.document, W = window.parent;
+      let active = true;
       const toTop = () => {
+        if (!active) return;
         for (const el of d.querySelectorAll('[data-testid="stAppScrollToBottomContainer"]')) {
-          el.dispatchEvent(new W.WheelEvent('wheel', {deltaY: -1000, bubbles: true}));
+          if (el.scrollTop === 0) continue;
+          el.dispatchEvent(new W.WheelEvent('wheel', {deltaY: -1000, bubbles: true}));  // "user scrolled up"
           el.scrollTop = 0;
         }
       };
       const events = ['wheel', 'touchstart', 'pointerdown', 'keydown'];
-      const stop = (e) => { if (e && !e.isTrusted) return;  // ignore our own simulated scroll
-        clearInterval(timer); for (const ev of events) d.removeEventListener(ev, stop, true); };
+      const stop = (e) => {
+        if (e && e.type !== 'pagehide' && !e.isTrusted) return;  // ignore our own simulated scroll
+        active = false; clearInterval(timer);
+        for (const ev of events) d.removeEventListener(ev, stop, true);
+      };
       for (const ev of events) d.addEventListener(ev, stop, true);
-      const timer = setInterval(toTop, 150);
-      setTimeout(() => stop(), 6000);
+      window.addEventListener('pagehide', stop);
+      const timer = setInterval(toTop, 100);
       toTop();
     }</script>""", height=0)
 
